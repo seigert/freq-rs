@@ -7,8 +7,8 @@ use std::{
 use clap::Clap;
 use memmap::*;
 
-const H: usize = 2166136261;
-const P: usize = 0x1000193;
+const H: usize = 2_166_136_261;
+const P: usize = 0x0100_0193;
 
 /// Counts number of unique `[a-zA-Z]+` words in input.
 #[derive(Clap, Debug)]
@@ -29,23 +29,17 @@ fn main() {
     let mut dict = FrequencyHashMap::new();
 
     for &byte in input.iter() {
-        if b'a' <= byte && byte <= b'z' {
+        if (b'a' <= byte && byte <= b'z') || (b'A' <= byte && byte <= b'Z') {
+            hash = (hash ^ (byte | 0x20) as usize) * P;
             word.push(byte);
-            hash = (hash ^ byte as usize) * P;
-            continue;
-        } else if b'A' <= byte && byte <= b'Z' {
-            let byte = byte ^ 0x20;
-            word.push(byte);
-            hash = (hash ^ byte as usize) * P;
-            continue;
         } else if !word.is_empty() {
-            *dict.put_mut(hash, &word) += 1;
+            dict.register(hash, &word);
             word.clear();
             hash = H;
         }
     }
     if !word.is_empty() {
-        *dict.put_mut(hash, &word) += 1;
+        dict.register(hash, &word);
     }
 
     let mut output = create_output(&opts);
@@ -72,6 +66,10 @@ struct FrequencyHashEntry {
     hash: usize,
 }
 
+struct FrequencyHashIntoIter {
+    iter: std::vec::IntoIter<Option<FrequencyHashEntry>>
+}
+
 impl FrequencyHashMap {
     const INITIAL: usize = 128;
     const LOAD_FACTOR: f32 = 0.9;
@@ -86,90 +84,69 @@ impl FrequencyHashMap {
         }
     }
 
-    fn put_mut(&mut self, hash: usize, word: &[u8]) -> &mut usize {
-        self.ensure_capacity();
-
+    fn register(&mut self, hash: usize, word: &[u8]) {
         let mut index = hash & self.mask;
         loop {
-            match &self.buckets[index] {
+            match unsafe { self.buckets.get_unchecked_mut(index) } {
                 Some(entry) => {
-                    if hash != entry.hash || word.as_ref() != entry.key.as_ref() {
-                        index = (index + 1) & self.mask
+                    if entry.hash == hash && entry.key.eq_ignore_ascii_case(word) {
+                        entry.value += 1;
+                        return;
                     } else {
-                        break;
+                        index = (index + 1) & self.mask
                     }
                 }
-                None => {
-                    self.buckets[index] = Some(FrequencyHashEntry {
-                        key: word.into(),
-                        value: 0,
+                none => {
+                    none.replace(FrequencyHashEntry {
+                        key: word.to_ascii_lowercase().into_boxed_slice(),
+                        value: 1,
                         hash,
                     });
+
                     self.length += 1;
+                    if self.length > self.max {
+                        self.ensure_capacity();
+                    }
                     break;
                 }
             }
         }
-
-        &mut self.buckets[index].as_mut().unwrap().value
     }
 
     fn ensure_capacity(&mut self) {
-        if self.length > self.max {
-            assert!(self.length < 2 * self.capacity);
-
-            self.capacity = 2 * self.capacity;
+        while self.length > self.max {
+            self.capacity *= 2;
             self.mask = self.capacity - 1;
             self.max = (Self::LOAD_FACTOR * self.capacity as f32) as usize;
+        }
 
-            let new_buckets = vec![None; self.capacity];
-            let old_buckets = std::mem::replace(&mut self.buckets, new_buckets);
-            for bucket in old_buckets {
-                if let Some(entry) = bucket {
-                    let mut index = entry.hash & self.mask;
-                    while let Some(_) = self.buckets[index] {
-                        index = (index + 1) & self.mask;
+        let new_buckets = vec![None; self.capacity];
+        for bucket in std::mem::replace(&mut self.buckets, new_buckets) {
+            if let Some(entry) = bucket {
+                let mut index = entry.hash & self.mask;
+                loop {
+                    match unsafe { self.buckets.get_unchecked_mut(index) } {
+                        Some(_) => index = (index + 1) & self.mask,
+                        none => {
+                            none.replace(entry);
+                            break;
+                        }
                     }
-
-                    self.buckets[index] = Some(entry);
                 }
             }
         }
-    }
-}
-
-struct FrequencyIntoIter {
-    iter: std::vec::IntoIter<Option<FrequencyHashEntry>>
-}
-
-impl Iterator for FrequencyIntoIter {
-    type Item = (usize, String);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while let Some(opt) = self.iter.next() {
-            if let Some(entry) = opt {
-                let key = std::str::from_utf8(entry.key.as_ref()).unwrap().to_owned();
-                return Some((entry.value, key));
-            }
-        }
-        None
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let (_, upper) = self.iter.size_hint();
-        (0, upper)
     }
 }
 
 impl IntoIterator for FrequencyHashMap {
     type Item = (usize, String);
-    type IntoIter = FrequencyIntoIter;
+    type IntoIter = FrequencyHashIntoIter;
 
     fn into_iter(self) -> Self::IntoIter {
         let mut buckets = self.buckets;
         buckets.sort_unstable();
 
-        FrequencyIntoIter {
+        FrequencyHashIntoIter {
             iter: buckets.into_iter()
         }
     }
@@ -193,6 +170,25 @@ impl Eq for FrequencyHashEntry {}
 impl PartialEq for FrequencyHashEntry {
     fn eq(&self, other: &Self) -> bool {
         Ord::cmp(&self, &other) == Ordering::Equal
+    }
+}
+
+impl Iterator for FrequencyHashIntoIter {
+    type Item = (usize, String);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(opt) = self.iter.next() {
+            if let Some(entry) = opt {
+                let key = std::str::from_utf8(&entry.key).unwrap().to_owned();
+                return Some((entry.value, key));
+            }
+        }
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let (_, upper) = self.iter.size_hint();
+        (0, upper)
     }
 }
 
